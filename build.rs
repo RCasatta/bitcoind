@@ -78,8 +78,18 @@ fn main() {
         );
         let mut downloaded_bytes = Vec::new();
 
-        let _size = ureq::get(&url)
+        let http_proxy = std::env::var("HTTPS_PROXY").or_else(|_| std::env::var("HTTP_PROXY"));
+        let agent = if let Ok(proxy) = http_proxy {
+            let proxy = ureq::Proxy::new(proxy).unwrap();
+            ureq::AgentBuilder::new().proxy(proxy).build()
+        } else {
+            ureq::AgentBuilder::new().build()
+        };
+
+        let _size = agent
+            .get(&url)
             .call()
+            .unwrap()
             .into_reader()
             .read_to_end(&mut downloaded_bytes)
             .unwrap();
