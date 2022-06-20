@@ -15,13 +15,13 @@ mod versions;
 
 use crate::bitcoincore_rpc::jsonrpc::serde_json::Value;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
-use log::debug;
+use log::{debug, error, warn};
 use std::ffi::OsStr;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
-use std::{env, fmt, thread};
+use std::{env, fmt, fs, thread};
 use tempfile::TempDir;
 
 pub extern crate bitcoincore_rpc;
@@ -33,12 +33,30 @@ pub struct BitcoinD {
     process: Child,
     /// Rpc client linked to this bitcoind process
     pub client: Client,
-    /// Work directory, where the node store blocks and other stuff. It is kept in the struct so that
-    /// directory is deleted only when this struct is dropped
-    _work_dir: TempDir,
+    /// Work directory, where the node store blocks and other stuff.
+    work_dir: DataDir,
 
     /// Contains information to connect to this node
     pub params: ConnectParams,
+}
+
+/// The DataDir struct defining the kind of data directory the node
+/// will contain. Data directory can be either persistent, or temporary.
+pub enum DataDir {
+    /// Persistent Data Directory
+    Persistent(PathBuf),
+    /// Temporary Data Directory
+    Temporary(TempDir),
+}
+
+impl DataDir {
+    /// Return the data directory path
+    fn path(&self) -> PathBuf {
+        match self {
+            Self::Persistent(path) => path.to_owned(),
+            Self::Temporary(tmp_dir) => tmp_dir.path().to_path_buf(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -55,7 +73,7 @@ pub struct ConnectParams {
 }
 
 /// Enum to specify p2p settings
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum P2P {
     /// the node doesn't open a p2p port and work in standalone mode
     No,
@@ -77,10 +95,15 @@ pub enum Error {
     NoFeature,
     /// Returned when calling methods requiring a env var to exist, but it's not
     NoEnvVar,
-    /// Returned when calling methods requiring either a feature or env var, but both are absent
-    NeitherFeatureNorEnvVar,
+    /// Returned when calling methods requiring the bitcoind executable but none is found
+    /// (no feature, no `BITCOIND_EXE`, no `bitcoind` in `PATH` )
+    NoBitcoindExecutableFound,
     /// Returned when calling methods requiring either a feature or anv var, but both are present
     BothFeatureAndEnvVar,
+    /// Wrapper of early exit status
+    EarlyExit(ExitStatus),
+    /// Returned when both tmpdir and staticdir is specified in `Conf` options
+    BothDirsSpecified,
 }
 
 impl fmt::Debug for Error {
@@ -90,8 +113,10 @@ impl fmt::Debug for Error {
             Error::Rpc(e) => write!(f, "{:?}", e),
             Error::NoFeature => write!(f, "Called a method requiring a feature to be set, but it's not"),
             Error::NoEnvVar => write!(f, "Called a method requiring env var `BITCOIND_EXE` to be set, but it's not"),
-            Error::NeitherFeatureNorEnvVar =>  write!(f, "Called a method requiring env var `BITCOIND_EXE` or a feature to be set, but neither are set"),
+            Error::NoBitcoindExecutableFound =>  write!(f, "`bitcoind` executable is required, provide it with one of the following: set env var `BITCOIND_EXE` or use a feature like \"22_0\" or have `bitcoind` executable in the `PATH`"),
             Error::BothFeatureAndEnvVar => write!(f, "Called a method requiring env var `BITCOIND_EXE` or a feature to be set, but both are set"),
+            Error::EarlyExit(e) => write!(f, "The bitcoind process terminated early with exit code {}", e),
+            Error::BothDirsSpecified => write!(f, "tempdir and staticdir cannot be enabled at same time in configuration options")
         }
     }
 }
@@ -120,11 +145,13 @@ const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 /// conf.p2p = bitcoind::P2P::No;
 /// conf.network = "regtest";
 /// conf.tmpdir = None;
+/// conf.staticdir = None;
+/// conf.attempts = 3;
 /// assert_eq!(conf, bitcoind::Conf::default());
 /// ```
 ///
 #[non_exhaustive]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Conf<'a> {
     /// Bitcoind command line arguments containing no spaces like `vec!["-dbcache=300", "-regtest"]`
     /// note that `port`, `rpcport`, `connect`, `datadir`, `listen`
@@ -141,12 +168,30 @@ pub struct Conf<'a> {
     /// directory with different/esoteric networks
     pub network: &'a str,
 
-    /// Optionally specify the root of where the temporary directories will be created.
-    /// If none and the env var `TEMPDIR_ROOT` is set, the env var is used.
-    /// If none and the env var `TEMPDIR_ROOT` is not set, the default temp dir of the OS is used.
-    /// It may be useful for example to set to a ramdisk so that bitcoin nodes spawn very fast
-    /// because their datadirs are in RAM
+    /// Optionally specify a temporary or persistent working directory for the node.
+    /// The following two parameters can be configured to simulate desired working directory configuration.
+    ///
+    /// tmpdir is Some() && staticdir is Some() : Error. Cannot be enabled at same time.
+    /// tmpdir is Some(temp_path) && staticdir is None : Create temporary directory at `tmpdir` path.
+    /// tmpdir is None && staticdir is Some(work_path) : Create persistent directory at `staticdir` path.
+    /// tmpdir is None && staticdir is None: Creates a temporary directory in OS default temporary directory (eg /tmp) or `TEMPDIR_ROOT` env variable path.
+    ///
+    /// It may be useful for example to set to a ramdisk via `TEMPDIR_ROOT` env option so that
+    /// bitcoin nodes spawn very fast because their datadirs are in RAM. Should not be enabled with persistent
+    /// mode, as it cause memory overflows.
+
+    /// Temporary directory path
     pub tmpdir: Option<PathBuf>,
+
+    /// Persistent directory path
+    pub staticdir: Option<PathBuf>,
+
+    /// Try to spawn the process `attempt` time
+    ///
+    /// The OS is giving available ports to use, however, they aren't booked, so it could rarely
+    /// happen they are used at the time the process is spawn. When retrying other available ports
+    /// are returned reducing the probability of conflicts to negligible.
+    pub attempts: u8,
 }
 
 impl Default for Conf<'_> {
@@ -157,6 +202,8 @@ impl Default for Conf<'_> {
             p2p: P2P::No,
             network: "regtest",
             tmpdir: None,
+            staticdir: None,
+            attempts: 3,
         }
     }
 }
@@ -171,16 +218,23 @@ impl BitcoinD {
 
     /// Launch the bitcoind process from the given `exe` executable with given [Conf] param
     pub fn with_conf<S: AsRef<OsStr>>(exe: S, conf: &Conf) -> Result<BitcoinD, Error> {
-        let work_dir = match &conf.tmpdir {
-            Some(path) => TempDir::new_in(path),
-            None => match env::var("TEMPDIR_ROOT") {
-                Ok(env_path) => TempDir::new_in(env_path),
-                Err(_) => TempDir::new(),
-            },
-        }?;
-        debug!("work_dir: {:?}", work_dir);
-        let datadir = work_dir.path().to_path_buf();
-        let cookie_file = datadir.join(conf.network).join(".cookie");
+        let tmpdir = conf
+            .tmpdir
+            .clone()
+            .or_else(|| env::var("TEMPDIR_ROOT").map(PathBuf::from).ok());
+        let work_dir = match (&tmpdir, &conf.staticdir) {
+            (Some(_), Some(_)) => return Err(Error::BothDirsSpecified),
+            (Some(tmpdir), None) => DataDir::Temporary(TempDir::new_in(tmpdir)?),
+            (None, Some(workdir)) => {
+                fs::create_dir_all(workdir)?;
+                DataDir::Persistent(workdir.to_owned())
+            }
+            (None, None) => DataDir::Temporary(TempDir::new()?),
+        };
+
+        let work_dir_path = work_dir.path();
+        debug!("work_dir: {:?}", work_dir_path);
+        let cookie_file = work_dir_path.join(conf.network).join(".cookie");
         let rpc_port = get_available_port()?;
         let rpc_socket = SocketAddrV4::new(LOCAL_IP, rpc_port);
         let rpc_url = format!("http://{}", rpc_socket);
@@ -211,7 +265,7 @@ impl BitcoinD {
             Stdio::null()
         };
 
-        let datadir_arg = format!("-datadir={}", datadir.display());
+        let datadir_arg = format!("-datadir={}", work_dir_path.display());
         let rpc_arg = format!("-rpcport={}", rpc_port);
         let default_args = [&datadir_arg, &rpc_arg];
 
@@ -221,7 +275,7 @@ impl BitcoinD {
             default_args,
             p2p_args
         );
-        let process = Command::new(exe)
+        let mut process = Command::new(exe.as_ref())
             .args(&default_args)
             .args(&p2p_args)
             .args(&conf.args)
@@ -231,6 +285,17 @@ impl BitcoinD {
         let node_url_default = format!("{}/wallet/default", rpc_url);
         // wait bitcoind is ready, use default wallet
         let client = loop {
+            if let Some(status) = process.try_wait()? {
+                if conf.attempts > 0 {
+                    warn!("early exit with: {:?}. Trying to launch again ({} attempts remaining), maybe some other process used our available port", status, conf.attempts);
+                    let mut conf = conf.clone();
+                    conf.attempts -= 1;
+                    return Self::with_conf(exe, &conf);
+                } else {
+                    error!("early exit with: {:?}", status);
+                    return Err(Error::EarlyExit(status));
+                }
+            }
             thread::sleep(Duration::from_millis(500));
             assert!(process.stderr.is_none());
             let client_result = Client::new(&rpc_url, Auth::CookieFile(cookie_file.clone()));
@@ -239,11 +304,15 @@ impl BitcoinD {
                 // to be compatible with different version, in the end we are only interested if
                 // the call is succesfull not in the returned value.
                 if client_base.call::<Value>("getblockchaininfo", &[]).is_ok() {
-                    client_base
+                    // Try creating new wallet, if fails due to already existing wallet file
+                    // try loading the same. Return if still errors.
+                    if client_base
                         .create_wallet("default", None, None, None, None)
-                        .unwrap();
-                    break Client::new(&node_url_default, Auth::CookieFile(cookie_file.clone()))
-                        .unwrap();
+                        .is_err()
+                    {
+                        client_base.load_wallet("default")?;
+                    }
+                    break Client::new(&node_url_default, Auth::CookieFile(cookie_file.clone()))?;
                 }
             }
         };
@@ -251,9 +320,9 @@ impl BitcoinD {
         Ok(BitcoinD {
             process,
             client,
-            _work_dir: work_dir,
+            work_dir,
             params: ConnectParams {
-                datadir,
+                datadir: work_dir_path,
                 cookie_file,
                 rpc_socket,
                 p2p_socket,
@@ -275,6 +344,11 @@ impl BitcoinD {
             self.params.rpc_socket,
             wallet_name.as_ref()
         )
+    }
+
+    /// Return the current workdir path of the running node
+    pub fn workdir(&self) -> PathBuf {
+        self.work_dir.path()
     }
 
     /// Returns the [P2P] enum to connect to this node p2p port
@@ -304,6 +378,9 @@ impl BitcoinD {
 
 impl Drop for BitcoinD {
     fn drop(&mut self) {
+        if let DataDir::Persistent(_) = self.work_dir {
+            let _ = self.stop();
+        }
         let _ = self.process.kill();
     }
 }
@@ -349,7 +426,9 @@ pub fn exe_path() -> Result<String, Error> {
         (Ok(_), Ok(_)) => Err(Error::BothFeatureAndEnvVar),
         (Ok(path), Err(_)) => Ok(path),
         (Err(_), Ok(path)) => Ok(path),
-        (Err(_), Err(_)) => Err(Error::NeitherFeatureNorEnvVar),
+        (Err(_), Err(_)) => which::which("bitcoind")
+            .map_err(|_| Error::NoBitcoindExecutableFound)
+            .map(|p| p.display().to_string()),
     }
 }
 
@@ -361,6 +440,7 @@ mod test {
     use crate::{get_available_port, BitcoinD, Conf, LOCAL_IP, P2P};
     use bitcoincore_rpc::RpcApi;
     use std::net::SocketAddrV4;
+    use tempfile::TempDir;
 
     #[test]
     fn test_local_ip() {
@@ -373,7 +453,6 @@ mod test {
     #[test]
     fn test_bitcoind() {
         let exe = init();
-        println!("{}", exe);
         let bitcoind = BitcoinD::new(exe).unwrap();
         let info = bitcoind.client.get_blockchain_info().unwrap();
         assert_eq!(0, info.blocks);
@@ -417,7 +496,42 @@ mod test {
     }
 
     #[test]
+    fn test_data_persistence() {
+        // Create a Conf with staticdir type
+        let mut conf = Conf::default();
+        let datadir = TempDir::new().unwrap();
+        conf.staticdir = Some(datadir.path().to_path_buf());
+
+        // Start BitcoinD with persistent db config
+        // Generate 101 blocks
+        // Wallet balance should be 50
+        let bitcoind = BitcoinD::with_conf(exe_path().unwrap(), &conf).unwrap();
+        let core_addrs = bitcoind.client.get_new_address(None, None).unwrap();
+        bitcoind
+            .client
+            .generate_to_address(101, &core_addrs)
+            .unwrap();
+        let wallet_balance_1 = bitcoind.client.get_balance(None, None).unwrap();
+        let best_block_1 = bitcoind.client.get_best_block_hash().unwrap();
+
+        drop(bitcoind);
+
+        // Start a new BitcoinD with the same datadir
+        let bitcoind = BitcoinD::with_conf(exe_path().unwrap(), &conf).unwrap();
+
+        let wallet_balance_2 = bitcoind.client.get_balance(None, None).unwrap();
+        let best_block_2 = bitcoind.client.get_best_block_hash().unwrap();
+
+        // Check node chain data persists
+        assert_eq!(best_block_1, best_block_2);
+
+        // Check the node wallet balance persists
+        assert_eq!(wallet_balance_1, wallet_balance_2);
+    }
+
+    #[test]
     fn test_multi_p2p() {
+        let _ = env_logger::try_init();
         let mut conf_node1 = Conf::default();
         conf_node1.p2p = P2P::Yes;
         let node1 = BitcoinD::with_conf(exe_path().unwrap(), &conf_node1).unwrap();

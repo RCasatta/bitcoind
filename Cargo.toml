@@ -1,6 +1,6 @@
 [package]
 name = "bitcoind"
-version = "0.24.0"
+version = "0.26.1"
 authors = ["Riccardo Casatta <riccardo@casatta.it>"]
 description = "Utility to run a regtest bitcoind process, useful in integration testing environment"
 license = "MIT"
@@ -9,10 +9,11 @@ documentation = "https://docs.rs/bitcoind/"
 edition = "2018"
 
 [dependencies]
-bitcoincore-rpc = "0.14.0"
+bitcoincore-rpc = "0.15.0"
 tempfile = "3.1"
 log = "0.4"
 home = "0.5.3"  # use same ver in build-dep
+which = "4.2.5"
 
 [dev-dependencies]
 env_logger = "0.8"
@@ -20,10 +21,12 @@ env_logger = "0.8"
 [build-dependencies]
 ureq = "2.1"
 bitcoin_hashes = "0.10"
-flate2 = "1.0"
 tar = "0.4"
+filetime = "=0.2.15"
+flate2 = "=1.0.22"
 
 [features]
+"23_0" = []
 "22_0" = []
 "0_21_1" = []
 "0_21_0" = []
